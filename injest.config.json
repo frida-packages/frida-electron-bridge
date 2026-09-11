@@ -1,0 +1,25 @@
+{
+  "default": "fixture",
+  "targets": {
+    "fixture": {
+      "device": "local",
+      "session": {
+        "spawn": "node_modules/electron/dist/Electron.app/Contents/MacOS/Electron",
+        "args": [
+          "tests/fixture"
+        ]
+      },
+      "timeout": 30000
+    },
+    "discord": {
+      "device": "local",
+      "session": {
+        "spawn": "/Applications/Discord.app/Contents/MacOS/Discord"
+      },
+      "timeout": 30000
+    }
+  },
+  "include": [
+    "tests/**/*.test.ts"
+  ]
+}
