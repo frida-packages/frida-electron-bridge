@@ -2,6 +2,14 @@
   "name": "frida-electron-bridge",
   "version": "1.0.0",
   "description": "Electron/Node.js runtime interop from Frida",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/frida-packages/frida-electron-bridge.git"
+  },
+  "bugs": {
+    "url": "https://github.com/frida-packages/frida-electron-bridge/issues"
+  },
+  "homepage": "https://github.com/frida-packages/frida-electron-bridge#readme",
   "keywords": [
     "frida-gum",
     "frida-gum-bridge",
