@@ -2,9 +2,9 @@
 
 Electron/Node.js runtime interop from Frida.
 
-Where [frida-objc-bridge](https://github.com/frida/frida-objc-bridge) reaches
+Where [frida-objc-bridge](https://github.com/frida-packages/frida-objc-bridge) reaches
 into the Objective-C runtime and
-[frida-java-bridge](https://github.com/frida/frida-java-bridge) into the JVM,
+[frida-java-bridge](https://github.com/frida-packages/frida-java-bridge) into the JVM,
 this bridge reaches into the V8 isolate that Electron runs its JavaScript on —
 in the main process and in renderers alike. It attaches to the isolate through
 Node's stable N-API C ABI, so your Frida agent can read globals, call functions,
@@ -152,7 +152,7 @@ module observer, so instrumenting from launch works.
 
 ## Testing
 
-The suite runs inside GumJS via [injest](https://github.com/frida/injest),
+The suite runs inside GumJS via [injest](https://github.com/frida-packages/injest),
 against a minimal Electron app in `tests/fixture`:
 
 ```sh
