@@ -41,16 +41,18 @@ const versions = await Electron.evaluate("process.versions");
 
 ### `Electron`
 
-- `available: boolean` — whether an Electron/Node runtime is present in this
-  process.
+- `available: boolean` — whether a supported Electron/Node runtime is present in
+  this process.
 - `hasNodeEnvironment: boolean` — whether this process hosts a Node
   environment, decided from its command line the way Electron decides it: the
   main process and non-sandboxed renderers do, `utilityProcess` children do,
   sandboxed renderers, the GPU process and other utility processes do not.
 - `perform<T>(fn: (realm: Realm) => T): Promise<T>` — run `fn` on the JavaScript
-  thread.
+  thread. Rejects right away where `hasNodeEnvironment` is `false`, and when the
+  runtime lacks something the bridge needs.
 - `evaluate(source: string): Promise<any>` — evaluate `source` and marshal the
   result.
+- `dispose(): Promise<void>` — tear the bridge down; see [Teardown](#teardown).
 
 ### `Realm`
 
@@ -100,6 +102,33 @@ Electron.perform(realm => {
 In a sandboxed renderer `Electron.hasNodeEnvironment` is `false` and `perform()`
 rejects; reach such renderers over the DevTools Protocol from the main process.
 
+## Teardown
+
+The bridge tears itself down when the script unloads, and `Electron.dispose()`
+does so on demand:
+
+```ts
+await Electron.dispose();
+```
+
+Agent functions the target still holds — callbacks passed into the app, `then`
+handlers installed by `realm.await()` — keep existing as target functions, but
+from then on they return `undefined` without calling into the agent, and the
+target collecting them no longer reaches the agent either. `dispose()` also
+releases the threadsafe function and every reference the bridge created,
+`JsRef`s from `persist()` included, and rejects pending `realm.await()`s. Work
+already queued with `perform()` runs first; `perform()` after `dispose()` starts
+over with a fresh environment.
+
+Unloading without `dispose()` is just as safe for the target, but cannot wait
+for its JavaScript thread, so the references stay in place until Node tears its
+environment down.
+
+Some things stay in the target for its lifetime, holding nothing that leads
+back into the agent: the `napi_env` the bridge minted (Node offers no way to
+destroy one), the small object behind the wrapped functions until the app drops
+the last of them, and any `Debugger` event listeners, which become no-ops.
+
 ## DevTools Protocol
 
 From the main process you can drive the Chrome DevTools Protocol against any
@@ -134,23 +163,31 @@ await session.addEventHandler((method, params) => {
 ## How it works
 
 1. The Electron framework is located by its exported `napi_open_handle_scope`.
-2. `v8::Function::Call` is hooked once, to land on the thread that owns the
-   isolate.
+2. Both overloads of `v8::Function::Call` and `uv_run` are hooked, to land on the
+   thread that owns the isolate while a Node context is entered. So that an idle
+   app gets there too, the bridge wakes libuv's default loop through its
+   internal work-queue handle, which makes Electron run the loop once.
 3. From there `napi_module_register_by_symbol()` mints a `napi_env` — as if a
-   native addon had been loaded — and the hook is removed.
+   native addon had been loaded — and the hooks are removed. Where that symbol
+   is not exported (Electron 33 and 34, and Windows), the bridge reaches the same
+   function through the one `napi_module_register()` hands to
+   `node_module_register()`, intercepting that call so that Node never sees it.
 4. A threadsafe function is created from that env, so later `perform()` calls
    are queued onto the app's event loop from Frida's thread without hooking
    anything.
 
-Everything above step 4 happens on the first `perform()`. If the runtime has not
-been loaded yet — e.g. on a gated spawn — the bridge waits for it through a
-module observer, so instrumenting from launch works.
+Everything above step 4 happens on the first `perform()`, within a few
+milliseconds even when the app is idle. If the runtime has not been loaded yet —
+e.g. on a gated spawn — the bridge waits for it through a module observer, so
+instrumenting from launch works.
 
 ## Requirements
 
-- A build whose Node exports `napi_module_register_by_symbol` — verified on
-  Electron 42 and 43. Older builds keep that symbol internal (Electron 33 does
-  not export it), and `Electron.available` reports `false` there.
+- Electron 33 or newer, 64-bit — verified on macOS arm64 with Electron 33, 34,
+  35, 40 and 45. The Windows symbol names and calling conventions are derived
+  from a Windows Electron 45 build's exports, but have not been run. A build
+  that lacks something the bridge needs reports `Electron.available` as `false`,
+  and `perform()` rejects with the missing exports named.
 - A Node environment in the process being instrumented. The main process always
   has one; a renderer has one unless the app sandboxes it. Without one there is
   no `napi_env` to mint, and `perform()` rejects — reach such renderers over the
@@ -160,7 +197,8 @@ module observer, so instrumenting from launch works.
 ## Testing
 
 The suite runs inside GumJS via [injest](https://github.com/frida-packages/injest),
-against a minimal Electron app in `tests/fixture`:
+against a minimal Electron app in `tests/fixture`, which sits idle once its
+window has loaded:
 
 ```sh
 npm install

@@ -32,5 +32,3 @@ app.whenReady().then(() => {
     const window = new BrowserWindow({ show: false });
     window.loadURL("data:text/html,<title>fixture window</title><body>hi</body>");
 });
-
-setInterval(() => {}, 20);

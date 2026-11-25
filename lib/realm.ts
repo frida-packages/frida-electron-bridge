@@ -8,22 +8,38 @@ import {
 } from "./api.js";
 import { JsProxy, JsRef, JsValue, makeProxy, unwrap, unwrapSymbol } from "./value.js";
 
-const MAX_CALLBACK_ARGS = 8;
+export const disposeSymbol = Symbol("frida-electron-bridge.dispose");
+export const abandonSymbol = Symbol("frida-electron-bridge.abandon");
 
 export class Realm {
     #env: NativePointer;
     #napi: Napi;
     #scratch: NativePointer;
+    #disposedFlag: NativePointer;
+    #functionWrapper: JsRef;
     #requireFn: JsRef | null = null;
+    #refs = new Set<JsRef>();
     #functions = new Map<number, Function>();
     #nextFunctionId = 1;
-    #invokeCallback: NativeCallback<"pointer", ["pointer", "pointer"]> | null = null;
-    #releaseCallback: NativeCallback<"void", ["pointer", "pointer", "pointer"]> | null = null;
+    #pendingAwaits = new Set<(reason: Error) => void>();
+    #invokeCallback: NativeCallback<"pointer", ["pointer", "pointer"]>;
+    #releaseCallback: NativeCallback<"pointer", ["pointer", "pointer"]>;
 
     constructor(env: NativePointer, api: Api) {
         this.#env = env;
         this.#napi = api.napi;
         this.#scratch = Memory.alloc(2 * Process.pointerSize);
+
+        this.#invokeCallback = new NativeCallback((_env: NativePointer, info: NativePointer): NativePointer => {
+            return this.#dispatchToAgent(info).handle;
+        }, "pointer", ["pointer", "pointer"]);
+        this.#releaseCallback = new NativeCallback((_env: NativePointer, info: NativePointer): NativePointer => {
+            return this.#releaseAgentFunction(info).handle;
+        }, "pointer", ["pointer", "pointer"]);
+
+        const { disposedFlag, functionWrapper } = this.withScope(() => this.#createFunctionWrapper());
+        this.#disposedFlag = disposedFlag;
+        this.#functionWrapper = functionWrapper;
     }
 
     get global(): JsProxy {
@@ -49,9 +65,16 @@ export class Realm {
     await(value: any): Promise<any> {
         const promise = unwrap(value);
         return new Promise((resolve, reject) => {
+            this.#pendingAwaits.add(reject);
             const onSettled = [
-                (result: any) => { resolve(this.toJs(result)); },
-                (reason: any) => { reject(new Error(this.readString(unwrap(reason)))); },
+                (result: any) => {
+                    this.#pendingAwaits.delete(reject);
+                    resolve(this.toJs(result));
+                },
+                (reason: any) => {
+                    this.#pendingAwaits.delete(reject);
+                    reject(new Error(this.readString(unwrap(reason))));
+                },
             ];
             this.callFunction(this.getProperty(promise, "then"), promise, onSettled);
         });
@@ -60,7 +83,9 @@ export class Realm {
     persist(value: any): JsRef {
         const result = this.#scratch;
         this.#check(this.#napi.createReference(this.#env, unwrap(value).handle, 1, result));
-        return new JsRef(this, result.readPointer());
+        const ref = new JsRef(this, result.readPointer());
+        this.#refs.add(ref);
+        return ref;
     }
 
     resolveRef(ref: JsRef): JsValue {
@@ -70,6 +95,7 @@ export class Realm {
     }
 
     freeRef(ref: JsRef): void {
+        this.#refs.delete(ref);
         this.#check(this.#napi.deleteReference(this.#env, ref.handle));
     }
 
@@ -237,6 +263,46 @@ export class Realm {
         return result.readU8() !== 0;
     }
 
+    [disposeSymbol](): void {
+        this[abandonSymbol]();
+
+        for (const ref of Array.from(this.#refs)) {
+            ref.free();
+        }
+
+        const disposed = new Error("Electron bridge disposed");
+        for (const reject of Array.from(this.#pendingAwaits)) {
+            reject(disposed);
+        }
+        this.#pendingAwaits.clear();
+    }
+
+    [abandonSymbol](): void {
+        this.#disposedFlag.writeU8(1);
+    }
+
+    #createFunctionWrapper(): { disposedFlag: NativePointer, functionWrapper: JsRef } {
+        const result = this.#scratch;
+        this.#check(this.#napi.createArraybuffer(this.#env, 1, result, result.add(Process.pointerSize)));
+        const disposedFlag = result.readPointer();
+        const flagBuffer = this.#adopt(result.add(Process.pointerSize).readPointer());
+
+        const factory = unwrap(this.evaluate(FUNCTION_WRAPPER_FACTORY));
+        const wrapper = this.callFunction(factory, null, [
+            flagBuffer,
+            this.#newNativeFunction(this.#invokeCallback),
+            this.#newNativeFunction(this.#releaseCallback),
+        ]);
+
+        return { disposedFlag, functionWrapper: this.persist(wrapper) };
+    }
+
+    #newNativeFunction(callback: NativeCallback<"pointer", ["pointer", "pointer"]>): JsValue {
+        const result = this.#scratch;
+        this.#check(this.#napi.createFunction(this.#env, NULL, 0, callback, NULL, result));
+        return this.#adopt(result.readPointer());
+    }
+
     #getRequire(): JsValue {
         if (this.#requireFn === null) {
             this.#requireFn = this.persist(this.evaluate(
@@ -254,59 +320,44 @@ export class Realm {
     }
 
     #newFunction(fn: Function): JsValue {
-        const { createFunction, addFinalizer } = this.#napi;
-        const env = this.#env;
-
         const id = this.#nextFunctionId++;
         this.#functions.set(id, fn);
-
-        const result = this.#scratch;
-        this.#check(createFunction(env, NULL, 0, this.#getInvokeCallback(), ptr(id), result));
-        const target = this.#adopt(result.readPointer());
-
-        this.#check(addFinalizer(env, target.handle, ptr(id), this.#getReleaseCallback(), NULL, NULL));
-
-        return target;
-    }
-
-    #getInvokeCallback(): NativeCallback<"pointer", ["pointer", "pointer"]> {
-        if (this.#invokeCallback === null) {
-            this.#invokeCallback = new NativeCallback((_env: NativePointer, info: NativePointer): NativePointer => {
-                return this.#dispatchToAgent(info).handle;
-            }, "pointer", ["pointer", "pointer"]);
-        }
-        return this.#invokeCallback;
+        return this.callFunction(this.#functionWrapper.get(), null, [id]);
     }
 
     #dispatchToAgent(info: NativePointer): JsValue {
-        const argc = Memory.alloc(Process.pointerSize);
-        argc.writeULong(MAX_CALLBACK_ARGS);
-        const argv = Memory.alloc(MAX_CALLBACK_ARGS * Process.pointerSize);
-        const data = Memory.alloc(Process.pointerSize);
-        this.#napi.getCbInfo(this.#env, info, argc, argv, NULL, data);
-
-        const args: any[] = [];
-        const n = argc.readULong().valueOf();
-        for (let i = 0; i !== n; i++) {
-            args.push(this.#adopt(argv.add(i * Process.pointerSize).readPointer()).wrap());
-        }
-
-        const fn = this.#functions.get(data.readPointer().toUInt32())!;
+        const [id, ...args] = this.#readArguments(info);
+        const fn = this.#functions.get(this.readNumber(id))!;
         try {
-            return this.fromJs(fn(...args));
+            return this.fromJs(fn(...args.map(arg => arg.wrap())));
         } catch (e) {
             this.#napi.throwError(this.#env, NULL, Memory.allocUtf8String((e as Error).message));
             return this.#invoke(this.#napi.getUndefined);
         }
     }
 
-    #getReleaseCallback(): NativeCallback<"void", ["pointer", "pointer", "pointer"]> {
-        if (this.#releaseCallback === null) {
-            this.#releaseCallback = new NativeCallback((_env: NativePointer, id: NativePointer): void => {
-                this.#functions.delete(id.toUInt32());
-            }, "void", ["pointer", "pointer", "pointer"]);
+    #releaseAgentFunction(info: NativePointer): JsValue {
+        const [id] = this.#readArguments(info);
+        this.#functions.delete(this.readNumber(id));
+        return this.#invoke(this.#napi.getUndefined);
+    }
+
+    #readArguments(info: NativePointer): JsValue[] {
+        const { getCbInfo } = this.#napi;
+        const env = this.#env;
+
+        const argc = Memory.alloc(Process.pointerSize);
+        getCbInfo(env, info, argc, NULL, NULL, NULL);
+        const n = argc.readPointer().toUInt32();
+
+        const argv = Memory.alloc(Math.max(n, 1) * Process.pointerSize);
+        getCbInfo(env, info, argc, argv, NULL, NULL);
+
+        const args: JsValue[] = [];
+        for (let i = 0; i !== n; i++) {
+            args.push(this.#adopt(argv.add(i * Process.pointerSize).readPointer()));
         }
-        return this.#releaseCallback;
+        return args;
     }
 
     #fromJsObject(value: any): JsValue {
@@ -411,3 +462,19 @@ export class Realm {
         return result.readPointer().readPointer().readUtf8String() ?? "unknown error";
     }
 }
+
+const FUNCTION_WRAPPER_FACTORY = `(function (flagBuffer, invoke, release) {
+    const disposed = new Uint8Array(flagBuffer);
+    const registry = new FinalizationRegistry(id => {
+        if (disposed[0] === 0) {
+            release(id);
+        }
+    });
+    return id => {
+        const fn = function (...args) {
+            return (disposed[0] === 0) ? invoke(id, ...args) : undefined;
+        };
+        registry.register(fn, id);
+        return fn;
+    };
+})`;

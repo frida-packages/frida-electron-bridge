@@ -1,4 +1,4 @@
-import { isAvailable, perform, PerformCallback } from "./runtime.js";
+import { dispose, hasNodeEnvironment, isAvailable, perform, PerformCallback } from "./runtime.js";
 
 export { ValueType } from "./api.js";
 export { Debugger } from "./debugger.js";
@@ -23,6 +23,10 @@ export class Electron {
 
     static evaluate(source: string): Promise<any> {
         return perform(realm => realm.toJs(realm.evaluate(source)));
+    }
+
+    static dispose(): Promise<void> {
+        return dispose();
     }
 }
 

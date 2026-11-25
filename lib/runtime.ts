@@ -1,12 +1,14 @@
 import {
     Api,
-    MODULE_API_VERSION,
+    CancelApiRequest,
+    NAPI_OK,
     NAPI_TSFN_BLOCKING,
+    NAPI_TSFN_RELEASE,
     tryGetApi,
     whenApiAvailable,
 } from "./api.js";
 import { getProcessRole, ProcessRole } from "./process.js";
-import { Realm } from "./realm.js";
+import { abandonSymbol, disposeSymbol, Realm } from "./realm.js";
 
 export type PerformCallback<T> = (realm: Realm) => T;
 
@@ -25,23 +27,25 @@ export function perform<T>(fn: PerformCallback<T>): Promise<T> {
     }
 
     return new Promise<T>((resolve, reject) => {
-        whenApiAvailable(api => {
-            getScheduler(api).schedule(realm => {
-                try {
-                    resolve(fn(realm));
-                } catch (e) {
-                    reject(e);
-                }
-            });
+        getScheduler().schedule({
+            run(realm) {
+                resolve(fn(realm));
+            },
+            fail: reject,
         });
     });
 }
 
-function getScheduler(api: Api): Scheduler {
-    if (cachedScheduler === null) {
-        cachedScheduler = new Scheduler(api);
+export async function dispose(): Promise<void> {
+    const scheduler = schedulers.active;
+    if (scheduler === null) {
+        return;
     }
-    return cachedScheduler;
+
+    schedulers.active = null;
+    schedulers.retiring.add(scheduler);
+    await scheduler.dispose();
+    schedulers.retiring.delete(scheduler);
 }
 
 function describeMissingNodeEnvironment({ type }: ProcessRole): string {
@@ -52,82 +56,202 @@ function describeMissingNodeEnvironment({ type }: ProcessRole): string {
     return `This process (--type=${type}) has no Node environment`;
 }
 
-let cachedScheduler: Scheduler | null = null;
+function getScheduler(): Scheduler {
+    if (schedulers.active === null) {
+        schedulers.active = new Scheduler();
+    }
+    return schedulers.active;
+}
+
+const schedulers = {
+    active: null as Scheduler | null,
+    retiring: new Set<Scheduler>(),
+};
+
+Script.bindWeak(schedulers, abandonSchedulers);
+
+function abandonSchedulers(): void {
+    schedulers.active?.abandon();
+    for (const scheduler of schedulers.retiring) {
+        scheduler.abandon();
+    }
+}
+
+interface Job {
+    run(realm: Realm): void;
+    fail(error: Error): void;
+}
+
+const EVENT_LOOP_WAKEUP_INTERVAL = 50;
+
+type SchedulerState = "idle" | "awaiting-runtime" | "bootstrapping" | "running" | "failed" | "disposed";
 
 class Scheduler {
-    #api: Api;
-    #jobs: PerformCallback<void>[] = [];
+    #state: SchedulerState = "idle";
+    #failure: Error | null = null;
+    #jobs: Job[] = [];
+    #api: Api | null = null;
+    #cancelApiRequest: CancelApiRequest | null = null;
+    #bootstrappers: InvocationListener[] = [];
+    #wakeupTimer: TimeoutId | null = null;
     #realm: Realm | null = null;
     #threadsafeFunction: NativePointer | null = null;
-    #bootstrapper: InvocationListener | null = null;
-    #callbacks: NativeCallback<"void" | "pointer", any>[] = [];
 
-    constructor(api: Api) {
-        this.#api = api;
-    }
+    schedule(job: Job): void {
+        if (this.#failure !== null) {
+            job.fail(this.#failure);
+            return;
+        }
 
-    schedule(fn: PerformCallback<void>): void {
-        this.#jobs.push(fn);
+        this.#jobs.push(job);
 
-        if (this.#threadsafeFunction !== null) {
+        if (this.#state === "idle") {
+            this.#awaitRuntime();
+        } else if (this.#state === "running") {
             this.#dispatch();
-        } else if (this.#bootstrapper === null) {
-            this.#startBootstrap();
         }
     }
 
-    #dispatch(): void {
-        const { callThreadsafeFunction } = this.#api.napi;
-        callThreadsafeFunction(this.#threadsafeFunction!, NULL, NAPI_TSFN_BLOCKING);
+    dispose(): Promise<void> {
+        if (this.#state !== "running") {
+            this.#cancelApiRequest?.();
+            this.#stopBootstrap();
+            this.#fail(new Error("Electron bridge disposed"));
+            this.#state = "disposed";
+            return Promise.resolve();
+        }
+
+        return new Promise((resolve, reject) => {
+            this.#jobs.push({
+                run: () => {
+                    this.#release();
+                    resolve();
+                },
+                fail: reject,
+            });
+            this.#dispatch();
+        });
     }
 
-    #startBootstrap(): void {
-        const { functionCall, isolateGetCurrent, getCurrentEventLoop } = this.#api;
+    abandon(): void {
+        if (this.#threadsafeFunction === null) {
+            return;
+        }
+
+        this.#realm![abandonSymbol]();
+        this.#api!.napi.releaseThreadsafeFunction(this.#threadsafeFunction, NAPI_TSFN_RELEASE);
+        this.#threadsafeFunction = null;
+        this.#state = "disposed";
+    }
+
+    #awaitRuntime(): void {
+        this.#state = "awaiting-runtime";
+
+        this.#cancelApiRequest = whenApiAvailable(api => {
+            if (api instanceof Error) {
+                this.#fail(api);
+            } else {
+                this.#startBootstrap(api);
+            }
+        });
+    }
+
+    #fail(error: Error): void {
+        this.#state = "failed";
+        this.#failure = error;
+
+        const jobs = this.#jobs.splice(0);
+        for (const job of jobs) {
+            job.fail(error);
+        }
+    }
+
+    #startBootstrap(api: Api): void {
+        const { jsEntryPoints, isolateGetCurrent, getCurrentEventLoop, registerModule, wakeEventLoop } = api;
+
+        this.#api = api;
+        this.#state = "bootstrapping";
 
         const onJsThreadEntered = () => {
-            const isolate = isolateGetCurrent();
-            if (getCurrentEventLoop(isolate).isNull()) {
+            if (this.#state !== "bootstrapping") {
                 return;
             }
 
-            this.#bootstrapper!.detach();
-            this.#bootstrapper = null;
-            this.#adoptIsolate(isolate);
+            const isolate = isolateGetCurrent();
+            if (isolate.isNull() || getCurrentEventLoop(isolate).isNull()) {
+                return;
+            }
+
+            if (!registerModule.ready) {
+                registerModule.prepareOutsideHooks(wakeEventLoop);
+                return;
+            }
+
+            this.#stopBootstrap();
+
+            try {
+                this.#adoptIsolate(isolate);
+            } catch (e) {
+                this.#fail(e as Error);
+                return;
+            }
+
+            this.#state = "running";
             this.#dispatch();
         };
 
-        this.#bootstrapper = Interceptor.attach(functionCall, onJsThreadEntered);
+        this.#bootstrappers = jsEntryPoints.map(target => Interceptor.attach(target, onJsThreadEntered));
+
+        wakeEventLoop();
+        this.#wakeupTimer = setInterval(wakeEventLoop, EVENT_LOOP_WAKEUP_INTERVAL);
+    }
+
+    #stopBootstrap(): void {
+        for (const bootstrapper of this.#bootstrappers.splice(0)) {
+            bootstrapper.detach();
+        }
+
+        if (this.#wakeupTimer !== null) {
+            clearInterval(this.#wakeupTimer);
+            this.#wakeupTimer = null;
+        }
     }
 
     #adoptIsolate(isolate: NativePointer): void {
-        const { isolateGetCurrentContext, objectNew, registerModuleBySymbol } = this.#api;
+        const { isolateGetCurrentContext, objectNew, registerModule } = this.#api!;
 
         const context = isolateGetCurrentContext(isolate);
         const exports = objectNew(isolate);
         const module = objectNew(isolate);
 
-        const onModuleInit = new NativeCallback((env: NativePointer): NativePointer => {
-            this.#adoptEnv(env);
+        let env = NULL;
+        const onModuleInit = new NativeCallback((moduleEnv: NativePointer): NativePointer => {
+            env = moduleEnv;
             return NULL;
         }, "pointer", ["pointer", "pointer"]);
-        this.#callbacks.push(onModuleInit);
 
-        registerModuleBySymbol(exports, module, context, onModuleInit, MODULE_API_VERSION);
+        registerModule.register(exports, module, context, onModuleInit);
+
+        this.#adoptEnv(env);
     }
 
     #adoptEnv(env: NativePointer): void {
-        const { napi } = this.#api;
+        const api = this.#api!;
+        const { napi } = api;
 
-        this.#realm = new Realm(env, this.#api);
-
-        const onJobsPending = new NativeCallback((): void => {
-            this.#runPendingJobs();
-        }, "void", ["pointer", "pointer", "pointer", "pointer"]);
-        this.#callbacks.push(onJobsPending);
+        const realm = new Realm(env, api);
+        this.#realm = realm;
 
         const result = Memory.alloc(Process.pointerSize);
-        napi.createThreadsafeFunction(env, NULL, NULL, this.#realm.newString("frida-electron-bridge"),
-            0, 1, NULL, NULL, NULL, onJobsPending, result);
+        const status = realm.withScope(() => {
+            const drain = realm.fromJs(() => { this.#runPendingJobs(); });
+            return napi.createThreadsafeFunction(env, drain.handle, NULL, realm.newString("frida-electron-bridge").handle,
+                0, 1, NULL, NULL, NULL, NULL, result);
+        });
+        if (status !== NAPI_OK) {
+            throw new Error(`Unable to create a threadsafe function (status ${status})`);
+        }
+
         const tsfn = result.readPointer();
         napi.unrefThreadsafeFunction(env, tsfn);
 
@@ -141,9 +265,25 @@ class Scheduler {
         this.#jobs = [];
 
         for (const job of jobs) {
-            realm.withScope(() => {
-                job(realm);
-            });
+            try {
+                realm.withScope(() => {
+                    job.run(realm);
+                });
+            } catch (e) {
+                job.fail(e as Error);
+            }
         }
+    }
+
+    #dispatch(): void {
+        const { callThreadsafeFunction } = this.#api!.napi;
+        callThreadsafeFunction(this.#threadsafeFunction!, NULL, NAPI_TSFN_BLOCKING);
+    }
+
+    #release(): void {
+        this.#realm![disposeSymbol]();
+        this.#api!.napi.releaseThreadsafeFunction(this.#threadsafeFunction!, NAPI_TSFN_RELEASE);
+        this.#threadsafeFunction = null;
+        this.#state = "disposed";
     }
 }
