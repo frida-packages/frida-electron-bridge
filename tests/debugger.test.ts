@@ -50,7 +50,7 @@ async function attachToWindow(): Promise<Debugger> {
 
 async function waitForWindow(): Promise<WebContentsTarget> {
     while (true) {
-        const window = (await Debugger.list()).find(target => target.type === "window" && target.url !== "");
+        const window = (await Debugger.list()).find(target => target.type === "window" && target.title === "fixture window");
         if (window !== undefined) {
             return window;
         }

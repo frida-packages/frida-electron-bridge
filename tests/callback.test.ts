@@ -1,7 +1,10 @@
-import { describe, expect, test } from "@frida/injest/agent";
+import { beforeEach, describe, expect, test } from "@frida/injest/agent";
 import Electron, { Realm } from "../lib/index.js";
+import { whenFixtureReady } from "./fixture-ready.js";
 
 describe("callbacks", () => {
+    beforeEach(whenFixtureReady);
+
     test("passes agent functions into the target", () => Electron.perform(realm => {
         const doubled = realm.global.fixture.numbers.map((n: any) => realm.toJs(n) * 2);
         expect(realm.toJs(doubled)).toEqual([2, 4, 6]);

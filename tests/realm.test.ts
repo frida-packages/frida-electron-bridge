@@ -1,7 +1,10 @@
-import { describe, expect, test } from "@frida/injest/agent";
+import { beforeEach, describe, expect, test } from "@frida/injest/agent";
 import Electron, { unwrap, ValueType } from "../lib/index.js";
+import { whenFixtureReady } from "./fixture-ready.js";
 
 describe("realm", () => {
+    beforeEach(whenFixtureReady);
+
     test("exposes the global object", () => Electron.perform(realm => {
         expect(realm.toJs(realm.global.fixture.greeting)).toBe("hello");
     }));
