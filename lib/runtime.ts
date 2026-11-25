@@ -167,43 +167,52 @@ class Scheduler {
     }
 
     #startBootstrap(api: Api): void {
-        const { jsEntryPoints, isolateGetCurrent, getCurrentEventLoop, registerModule, wakeEventLoop } = api;
+        const { jsEntryPoints, wakeEventLoop } = api;
 
         this.#api = api;
         this.#state = "bootstrapping";
 
-        const onJsThreadEntered = () => {
-            if (this.#state !== "bootstrapping") {
-                return;
-            }
+        this.#runBootstrapStep(() => {
+            const onJsThreadEntered = () => {
+                this.#runBootstrapStep(() => {
+                    this.#tryAdoptCurrentIsolate();
+                });
+            };
+            this.#bootstrappers = jsEntryPoints.map(target => Interceptor.attach(target, onJsThreadEntered));
 
-            const isolate = isolateGetCurrent();
-            if (isolate.isNull() || getCurrentEventLoop(isolate).isNull()) {
-                return;
-            }
+            wakeEventLoop();
+            this.#wakeupTimer = setInterval(() => {
+                this.#runBootstrapStep(wakeEventLoop);
+            }, EVENT_LOOP_WAKEUP_INTERVAL);
+        });
+    }
 
-            if (!registerModule.ready) {
-                registerModule.prepareOutsideHooks(wakeEventLoop);
-                return;
-            }
+    #runBootstrapStep(step: () => void): void {
+        if (this.#state !== "bootstrapping") {
+            return;
+        }
 
+        try {
+            step();
+        } catch (e) {
             this.#stopBootstrap();
+            this.#fail(e as Error);
+        }
+    }
 
-            try {
-                this.#adoptIsolate(isolate);
-            } catch (e) {
-                this.#fail(e as Error);
-                return;
-            }
+    #tryAdoptCurrentIsolate(): void {
+        const { isolateGetCurrent, getCurrentEventLoop } = this.#api!;
 
-            this.#state = "running";
-            this.#dispatch();
-        };
+        const isolate = isolateGetCurrent();
+        if (isolate.isNull() || getCurrentEventLoop(isolate).isNull()) {
+            return;
+        }
 
-        this.#bootstrappers = jsEntryPoints.map(target => Interceptor.attach(target, onJsThreadEntered));
+        this.#stopBootstrap();
+        this.#adoptIsolate(isolate);
 
-        wakeEventLoop();
-        this.#wakeupTimer = setInterval(wakeEventLoop, EVENT_LOOP_WAKEUP_INTERVAL);
+        this.#state = "running";
+        this.#dispatch();
     }
 
     #stopBootstrap(): void {
@@ -230,7 +239,7 @@ class Scheduler {
             return NULL;
         }, "pointer", ["pointer", "pointer"]);
 
-        registerModule.register(exports, module, context, onModuleInit);
+        registerModule(exports, module, context, onModuleInit);
 
         this.#adoptEnv(env);
     }

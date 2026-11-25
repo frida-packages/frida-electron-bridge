@@ -325,9 +325,9 @@ export class Realm {
     }
 
     #dispatchToAgent(info: NativePointer): JsValue {
-        const [id, ...args] = this.#readArguments(info);
-        const fn = this.#functions.get(this.readNumber(id))!;
         try {
+            const [id, ...args] = this.#readArguments(info);
+            const fn = this.#functions.get(this.readNumber(id))!;
             return this.fromJs(fn(...args.map(arg => arg.wrap())));
         } catch (e) {
             this.#napi.throwError(this.#env, NULL, Memory.allocUtf8String((e as Error).message));

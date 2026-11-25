@@ -11,11 +11,8 @@ export interface Api {
 
 export type LocalGetter = (isolate: NativePointer) => NativePointer;
 
-export interface ModuleRegistrar {
-    readonly ready: boolean;
-    prepareOutsideHooks(onReady: () => void): void;
-    register(exports: NativePointer, module: NativePointer, context: NativePointer, init: NativePointerValue): void;
-}
+export type ModuleRegistrar = (exports: NativePointer, module: NativePointer, context: NativePointer,
+    init: NativePointerValue) => void;
 
 export interface Napi {
     openHandleScope: NativeFunction<number, [NativePointerValue, NativePointerValue]>;
@@ -117,9 +114,17 @@ export type CancelApiRequest = () => void;
 
 function detect(): Api | Error | null {
     if (cachedDetection === null) {
-        cachedDetection = detectApi();
+        cachedDetection = tryDetectApi();
     }
     return cachedDetection;
+}
+
+function tryDetectApi(): Api | Error | null {
+    try {
+        return detectApi();
+    } catch (e) {
+        return e as Error;
+    }
 }
 
 function ignoreCancellation(): void {
@@ -166,14 +171,21 @@ function detectApi(): Api | Error | null {
         symbols.getCurrentEventLoop,
         symbols.functionCall,
         ...EVENT_LOOP_EXPORTS,
-        ...((registerModuleBySymbol === null) ? LEGACY_REGISTRATION_EXPORTS : []),
+        ...((registerModuleBySymbol === null) ? ["napi_module_register"] : []),
     ];
     const missing = required.filter(name => runtime.findExportByName(name) === null);
     if (missing.length !== 0) {
         return new Error(`Unsupported Electron runtime: ${runtime.name} does not export ${missing.join(", ")}`);
     }
 
-    const defaultLoopSlot = findDefaultLoopSlot(runtime.getExportByName("uv_default_loop"));
+    const napiContextRegister = (registerModuleBySymbol === null)
+        ? findCodeAddress(runtime, runtime.getExportByName("napi_module_register"))
+        : null;
+    if (registerModuleBySymbol === null && napiContextRegister === null) {
+        return new Error(`Unsupported Electron runtime: unable to locate the module registration in ${runtime.name}`);
+    }
+
+    const defaultLoopSlot = findLoadedAddress(runtime.getExportByName("uv_default_loop"));
     if (defaultLoopSlot === null) {
         return new Error(`Unsupported Electron runtime: unable to locate libuv's default loop in ${runtime.name}`);
     }
@@ -185,7 +197,7 @@ function detectApi(): Api | Error | null {
         getCurrentEventLoop: new NativeFunction(runtime.getExportByName(symbols.getCurrentEventLoop), "pointer", ["pointer"]),
         registerModule: (registerModuleBySymbol !== null)
             ? makeSymbolRegistrar(registerModuleBySymbol)
-            : new LegacyRegistrar(runtime),
+            : makeContextRegistrar(napiContextRegister!),
         jsEntryPoints: [symbols.functionCall, symbols.functionCallWithIsolate, "uv_run"]
             .map(name => runtime.findExportByName(name))
             .filter(address => address !== null) as NativePointer[],
@@ -259,93 +271,55 @@ function returnLocalThroughLeadingSlot(address: NativePointer): LocalGetter {
 
 function makeSymbolRegistrar(address: NativePointer): ModuleRegistrar {
     const impl = new NativeFunction(address, "void", ["pointer", "pointer", "pointer", "pointer", "int"]);
-    return {
-        ready: true,
-        prepareOutsideHooks() {
-        },
-        register(exports, module, context, init) {
-            impl(exports, module, context, init, MODULE_API_VERSION);
-        },
+    return (exports, module, context, init) => {
+        impl(exports, module, context, init, MODULE_API_VERSION);
     };
 }
 
-const LEGACY_REGISTRATION_EXPORTS = ["napi_module_register", "node_module_register"];
-
 const NAPI_MODULE_REGISTER_FUNC_OFFSET = 8 + Process.pointerSize;
 const NAPI_MODULE_SIZE = 8 + 8 * Process.pointerSize;
-const NODE_MODULE_CONTEXT_REGISTER_FUNC_OFFSET = 8 + 3 * Process.pointerSize;
-const NODE_MODULE_PRIV_OFFSET = 8 + 5 * Process.pointerSize;
 
-type ContextRegister = NativeFunction<void, [NativePointerValue, NativePointerValue, NativePointerValue, NativePointerValue]>;
-
-class LegacyRegistrar implements ModuleRegistrar {
-    #napiModuleRegister: NativeFunction<void, [NativePointerValue]>;
-    #nodeModuleRegister: NativePointer;
-    #probe = Memory.alloc(NAPI_MODULE_SIZE);
-    #probedNodeModule = NULL;
-    #interceptor: NativeCallback<"void", ["pointer"]>;
-    #contextRegister: ContextRegister | null = null;
-    #preparationScheduled = false;
-
-    constructor(runtime: Module) {
-        this.#napiModuleRegister = new NativeFunction(runtime.getExportByName("napi_module_register"), "void", ["pointer"]);
-        this.#nodeModuleRegister = runtime.getExportByName("node_module_register");
-
-        const forwardToNode = new NativeFunction(this.#nodeModuleRegister, "void", ["pointer"]);
-        this.#interceptor = new NativeCallback((nodeModule: NativePointer): void => {
-            if (nodeModule.add(NODE_MODULE_PRIV_OFFSET).readPointer().equals(this.#probe)) {
-                this.#probedNodeModule = nodeModule;
-            } else {
-                forwardToNode(nodeModule);
-            }
-        }, "void", ["pointer"]);
-    }
-
-    get ready(): boolean {
-        return this.#contextRegister !== null;
-    }
-
-    prepareOutsideHooks(onReady: () => void): void {
-        if (this.#preparationScheduled) {
-            return;
-        }
-        this.#preparationScheduled = true;
-        setTimeout(() => {
-            this.#contextRegister = this.#findContextRegister();
-            onReady();
-        }, 0);
-    }
-
-    register(exports: NativePointer, module: NativePointer, context: NativePointer, init: NativePointerValue): void {
+function makeContextRegistrar(address: NativePointer): ModuleRegistrar {
+    const impl = new NativeFunction(address, "void", ["pointer", "pointer", "pointer", "pointer"]);
+    return (exports, module, context, init) => {
         const napiModule = Memory.alloc(NAPI_MODULE_SIZE);
         napiModule.add(NAPI_MODULE_REGISTER_FUNC_OFFSET).writePointer(init);
-        this.#contextRegister!(exports, module, context, napiModule);
-    }
-
-    #findContextRegister(): ContextRegister {
-        Interceptor.replace(this.#nodeModuleRegister, this.#interceptor);
-        Interceptor.flush();
-        this.#napiModuleRegister(this.#probe);
-        Interceptor.revert(this.#nodeModuleRegister);
-        Interceptor.flush();
-
-        const address = this.#probedNodeModule.add(NODE_MODULE_CONTEXT_REGISTER_FUNC_OFFSET).readPointer();
-        return new NativeFunction(address, "void", ["pointer", "pointer", "pointer", "pointer"]);
-    }
+        impl(exports, module, context, napiModule);
+    };
 }
 
-const EVENT_LOOP_EXPORTS = ["uv_run", "uv_default_loop", "uv_async_send"];
+const INSTRUCTION_SEARCH_LIMIT = 32;
 
-const DEFAULT_LOOP_SEARCH_LIMIT = 16;
+function findCodeAddress(runtime: Module, code: NativePointer): NativePointer | null {
+    const address = findPcRelativeAddress(code, "address");
+    if (address === null || address.compare(runtime.base) < 0 || address.compare(runtime.base.add(runtime.size)) >= 0) {
+        return null;
+    }
+    return address;
+}
 
-function findDefaultLoopSlot(uvDefaultLoop: NativePointer): NativePointer | null {
+function findLoadedAddress(code: NativePointer): NativePointer | null {
+    return findPcRelativeAddress(code, "load");
+}
+
+function findPcRelativeAddress(code: NativePointer, use: "address" | "load"): NativePointer | null {
     const pages = new Map<string, NativePointer>();
-    let cursor = uvDefaultLoop;
-    for (let i = 0; i !== DEFAULT_LOOP_SEARCH_LIMIT; i++) {
+    let cursor = code;
+    for (let i = 0; i !== INSTRUCTION_SEARCH_LIMIT; i++) {
         const insn = Instruction.parse(cursor) as Arm64Instruction | X86Instruction;
-        const [destination, source] = insn.operands as any[];
+        const [destination, source, offset] = insn.operands as any[];
         if (insn.mnemonic === "adrp") {
             pages.set(destination.value, ptr(source.value.toString()));
+        } else if (use === "address") {
+            if (insn.mnemonic === "adr") {
+                return ptr(source.value.toString());
+            }
+            if (insn.mnemonic === "add" && pages.has(source.value) && offset?.type === "imm") {
+                return pages.get(source.value)!.add(offset.value);
+            }
+            if (insn.mnemonic === "lea" && source.value.base === "rip") {
+                return insn.next.add(source.value.disp);
+            }
         } else if (source?.type === "mem") {
             const { base, disp } = source.value;
             if (base === "rip") {
@@ -360,6 +334,8 @@ function findDefaultLoopSlot(uvDefaultLoop: NativePointer): NativePointer | null
     }
     return null;
 }
+
+const EVENT_LOOP_EXPORTS = ["uv_run", "uv_default_loop", "uv_async_send"];
 
 function makeEventLoopWaker(runtime: Module, defaultLoopSlot: NativePointer): () => void {
     const asyncSend = new NativeFunction(runtime.getExportByName("uv_async_send"), "int", ["pointer"]);

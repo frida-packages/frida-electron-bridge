@@ -180,8 +180,8 @@ await session.addEventHandler((method, params) => {
 3. From there `napi_module_register_by_symbol()` mints a `napi_env` — as if a
    native addon had been loaded — and the hooks are removed. Where that symbol
    is not exported (Electron 33 and 34, and Windows), the bridge reaches the same
-   function through the one `napi_module_register()` hands to
-   `node_module_register()`, intercepting that call so that Node never sees it.
+   function through the callback whose address `napi_module_register()` takes,
+   read from that function's code without calling it.
 4. A threadsafe function is created from that env, so later `perform()` calls
    are queued onto the app's event loop from Frida's thread without hooking
    anything.
