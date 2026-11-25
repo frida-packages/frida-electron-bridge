@@ -1,5 +1,5 @@
 import { describe, expect, test } from "@frida/injest/agent";
-import { Debugger, WebContentsTarget } from "../lib/index.js";
+import Electron, { Debugger, WebContentsTarget } from "../lib/index.js";
 
 describe("devtools protocol", () => {
     test("lists the app's web contents", async () => {
@@ -40,6 +40,28 @@ describe("devtools protocol", () => {
         expect(params.type).toBe("log");
 
         await target.detach();
+    });
+
+    test("keeps event handler errors out of the app", async () => {
+        await Electron.evaluate(`(() => {
+            globalThis.uncaughtInApp = [];
+            globalThis.recordUncaught = error => { uncaughtInApp.push(error.message); };
+            process.on("uncaughtException", recordUncaught);
+        })()`);
+
+        const target = await attachToWindow();
+        let calls = 0;
+        await target.addEventHandler(() => {
+            calls++;
+            throw new Error("buggy handler");
+        });
+        await target.send("Runtime.enable");
+        await target.evaluate("console.log('provoking the handler')");
+        await target.detach();
+
+        expect(calls).toBeGreaterThan(0);
+        const uncaught = await Electron.evaluate("(process.off('uncaughtException', recordUncaught), uncaughtInApp)");
+        expect(uncaught).toEqual([]);
     });
 });
 

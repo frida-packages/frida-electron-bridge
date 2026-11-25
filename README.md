@@ -166,7 +166,8 @@ await session.addEventHandler((method, params) => {
   session.
 - `session.send(method, params?)` — issue a command, resolving with its result.
 - `session.evaluate(expression)` — `Runtime.evaluate` shorthand, by value.
-- `session.addEventHandler(handler)` — receive protocol events.
+- `session.addEventHandler(handler)` — receive protocol events. An exception
+  thrown by `handler` is reported by the agent rather than raised inside the app.
 - `session.detach()`.
 
 ## How it works

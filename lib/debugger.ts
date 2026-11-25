@@ -48,7 +48,11 @@ export class Debugger {
     addEventHandler(handler: DebuggerEventHandler): Promise<void> {
         return perform(realm => {
             const onMessage = (_event: JsProxy, method: JsProxy, params: JsProxy) => {
-                handler(realm.toJs(method), realm.toJs(params));
+                try {
+                    handler(realm.toJs(method), realm.toJs(params));
+                } catch (e) {
+                    Script.nextTick(rethrow, e);
+                }
             };
             getDebugger(realm, this.#webContentsId).on("message", onMessage);
         });
@@ -80,4 +84,8 @@ function describeAllWebContents(realm: Realm): WebContentsTarget[] {
 
 function getDebugger(realm: Realm, webContentsId: number): JsProxy {
     return realm.require("electron").webContents.fromId(webContentsId).debugger;
+}
+
+function rethrow(error: Error): never {
+    throw error;
 }
