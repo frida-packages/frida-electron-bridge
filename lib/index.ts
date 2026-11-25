@@ -13,6 +13,10 @@ export class Electron {
         return isAvailable();
     }
 
+    static get hasNodeEnvironment(): boolean {
+        return hasNodeEnvironment();
+    }
+
     static perform<T>(fn: PerformCallback<T>): Promise<T> {
         return perform(fn);
     }

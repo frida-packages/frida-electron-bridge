@@ -5,6 +5,7 @@ import {
     tryGetApi,
     whenApiAvailable,
 } from "./api.js";
+import { getProcessRole, ProcessRole } from "./process.js";
 import { Realm } from "./realm.js";
 
 export type PerformCallback<T> = (realm: Realm) => T;
@@ -13,7 +14,16 @@ export function isAvailable(): boolean {
     return tryGetApi() !== null;
 }
 
+export function hasNodeEnvironment(): boolean {
+    return getProcessRole().hasNodeEnvironment;
+}
+
 export function perform<T>(fn: PerformCallback<T>): Promise<T> {
+    const role = getProcessRole();
+    if (!role.hasNodeEnvironment) {
+        return Promise.reject(new Error(describeMissingNodeEnvironment(role)));
+    }
+
     return new Promise<T>((resolve, reject) => {
         whenApiAvailable(api => {
             getScheduler(api).schedule(realm => {
@@ -32,6 +42,14 @@ function getScheduler(api: Api): Scheduler {
         cachedScheduler = new Scheduler(api);
     }
     return cachedScheduler;
+}
+
+function describeMissingNodeEnvironment({ type }: ProcessRole): string {
+    if (type === "renderer") {
+        return "This renderer is sandboxed, so it has no Node environment; "
+            + "reach it through Debugger from the main process instead";
+    }
+    return `This process (--type=${type}) has no Node environment`;
 }
 
 let cachedScheduler: Scheduler | null = null;

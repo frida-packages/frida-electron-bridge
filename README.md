@@ -43,6 +43,10 @@ const versions = await Electron.evaluate("process.versions");
 
 - `available: boolean` — whether an Electron/Node runtime is present in this
   process.
+- `hasNodeEnvironment: boolean` — whether this process hosts a Node
+  environment, decided from its command line the way Electron decides it: the
+  main process and non-sandboxed renderers do, `utilityProcess` children do,
+  sandboxed renderers, the GPU process and other utility processes do not.
 - `perform<T>(fn: (realm: Realm) => T): Promise<T>` — run `fn` on the JavaScript
   thread.
 - `evaluate(source: string): Promise<any>` — evaluate `source` and marshal the
@@ -83,7 +87,7 @@ versions.get("electron").toString();
 ## Renderer processes
 
 Renderers work the same way, as long as the app gives them a Node environment —
-which Electron does for a non-sandboxed preload, and which the bridge detects by
+which Electron does for non-sandboxed renderers, and which the bridge detects by
 waiting for a context that has one. From there `realm.global` is the page's
 global, so `location`, `document` and `navigator` are all in reach:
 
@@ -92,6 +96,9 @@ Electron.perform(realm => {
     send(realm.toJs(realm.global.document.title));
 });
 ```
+
+In a sandboxed renderer `Electron.hasNodeEnvironment` is `false` and `perform()`
+rejects; reach such renderers over the DevTools Protocol from the main process.
 
 ## DevTools Protocol
 
@@ -146,8 +153,8 @@ module observer, so instrumenting from launch works.
   not export it), and `Electron.available` reports `false` there.
 - A Node environment in the process being instrumented. The main process always
   has one; a renderer has one unless the app sandboxes it. Without one there is
-  no `napi_env` to mint, and `perform()` waits rather than completing — reach
-  such renderers over the DevTools Protocol from the main process instead.
+  no `napi_env` to mint, and `perform()` rejects — reach such renderers over the
+  DevTools Protocol from the main process instead.
 - `Debugger` is main-process only, since `webContents` lives there.
 
 ## Testing
