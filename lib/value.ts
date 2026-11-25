@@ -5,6 +5,11 @@ export const unwrapSymbol = Symbol.for("frida-electron-bridge.value");
 
 export type JsProxy = any;
 
+export interface ToJsOptions {
+    maxDepth?: number;
+    maxValues?: number;
+}
+
 export class JsValue {
     readonly realm: Realm;
     readonly handle: NativePointer;
@@ -31,25 +36,8 @@ export class JsValue {
         return this.realm.arrayLength(this);
     }
 
-    toJs(): any {
-        switch (this.type) {
-            case ValueType.Undefined:
-                return undefined;
-            case ValueType.Null:
-                return null;
-            case ValueType.Boolean:
-                return this.toBoolean();
-            case ValueType.Number:
-                return this.toNumber();
-            case ValueType.String:
-                return this.toString();
-            case ValueType.Bigint:
-                return this.toBigInt();
-            case ValueType.Object:
-                return this.isArray ? this.#toJsArray() : this.#toJsObject();
-            default:
-                return this;
-        }
+    toJs(options: ToJsOptions = {}): any {
+        return new Conversion(this.realm, options).convert(this);
     }
 
     toString(): string {
@@ -115,23 +103,115 @@ export class JsValue {
     persist(): JsRef {
         return this.realm.persist(this);
     }
+}
 
-    #toJsArray(): any[] {
-        const result: any[] = [];
-        const n = this.length;
-        for (let i = 0; i !== n; i++) {
-            result.push(this.get(i).toJs());
+class Conversion {
+    #realm: Realm;
+    #maxDepth: number;
+    #maxValues: number;
+    #valueCount = 0;
+    #path: (string | number)[] = [];
+    #identities: Identities | null = null;
+    #converted: any[] = [];
+
+    constructor(realm: Realm, { maxDepth = DEFAULT_MAX_DEPTH, maxValues = DEFAULT_MAX_VALUES }: ToJsOptions) {
+        this.#realm = realm;
+        this.#maxDepth = maxDepth;
+        this.#maxValues = maxValues;
+    }
+
+    convert(value: JsValue): any {
+        if (++this.#valueCount > this.#maxValues) {
+            throw this.#limitExceeded(`more than ${this.#maxValues} values`, "maxValues");
         }
+
+        switch (value.type) {
+            case ValueType.Undefined:
+                return undefined;
+            case ValueType.Null:
+                return null;
+            case ValueType.Boolean:
+                return value.toBoolean();
+            case ValueType.Number:
+                return value.toNumber();
+            case ValueType.String:
+                return value.toString();
+            case ValueType.Bigint:
+                return value.toBigInt();
+            case ValueType.Object:
+                return this.#convertObject(value);
+            default:
+                return value;
+        }
+    }
+
+    #convertObject(value: JsValue): any {
+        const identities = this.#getIdentities();
+        const known = identities.lookup.call(identities.map, [value]);
+        if (known.type === ValueType.Number) {
+            return this.#converted[known.toNumber()];
+        }
+
+        if (this.#path.length > this.#maxDepth) {
+            throw this.#limitExceeded(`nested more than ${this.#maxDepth} levels deep`, "maxDepth");
+        }
+
+        const isArray = value.isArray;
+        const result: any = isArray ? [] : {};
+        identities.record.call(identities.map, [value, this.#converted.length]);
+        this.#converted.push(result);
+
+        if (isArray) {
+            const n = value.length;
+            for (let i = 0; i !== n; i++) {
+                result.push(this.#convertChild(value, i));
+            }
+        } else {
+            for (const key of value.keys()) {
+                result[key] = this.#convertChild(value, key);
+            }
+        }
+
         return result;
     }
 
-    #toJsObject(): Record<string, any> {
-        const result: Record<string, any> = {};
-        for (const key of this.keys()) {
-            result[key] = this.get(key).toJs();
+    #getIdentities(): Identities {
+        if (this.#identities === null) {
+            const map = unwrap(this.#realm.evaluate("new Map()"));
+            this.#identities = { map, lookup: map.get("get"), record: map.get("set") };
         }
-        return result;
+        return this.#identities;
     }
+
+    #convertChild(parent: JsValue, key: string | number): any {
+        this.#path.push(key);
+        const child = this.convert(parent.get(key));
+        this.#path.pop();
+        return child;
+    }
+
+    #limitExceeded(problem: string, option: keyof ToJsOptions): RangeError {
+        return new RangeError(`toJs() stopped at ${describePath(this.#path)}: ${problem}; `
+            + `raise ${option} or convert a narrower value`);
+    }
+}
+
+interface Identities {
+    map: JsValue;
+    lookup: JsValue;
+    record: JsValue;
+}
+
+const DEFAULT_MAX_DEPTH = 100;
+const DEFAULT_MAX_VALUES = 100000;
+
+function describePath(path: (string | number)[]): string {
+    return "$" + path.map(key => {
+        if (typeof key === "number") {
+            return `[${key}]`;
+        }
+        return /^[A-Za-z_$][\w$]*$/.test(key) ? `.${key}` : `[${JSON.stringify(key)}]`;
+    }).join("");
 }
 
 export class JsRef {

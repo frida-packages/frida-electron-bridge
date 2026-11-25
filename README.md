@@ -64,7 +64,13 @@ The handle passed to `perform()`.
   `module.createRequire()` at the app's entry point (an app whose entry is an ES
   module has no main module).
 - `evaluate(source)` — evaluate source in the target's context.
-- `toJs(value)` — deep-convert a target value into a plain agent-side value.
+- `toJs(value, options?)` — deep-convert a target value into a plain agent-side
+  value. Objects reached more than once, cycles included, become the same
+  agent-side object, so the result mirrors the target's graph and may itself be
+  cyclic. Conversion throws a `RangeError` naming the path where it stopped once
+  objects nest deeper than `options.maxDepth` (default 100) or more than
+  `options.maxValues` values (default 100000) have been converted. Functions and
+  symbols are left as `JsValue`s.
 - `fromJs(value)` — convert an agent-side value into a target value. Agent
   functions become callable target functions, so the app can call back into your
   agent; each one is released when the target garbage-collects it.

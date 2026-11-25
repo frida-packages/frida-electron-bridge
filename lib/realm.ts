@@ -6,7 +6,7 @@ import {
     Napi,
     ValueType,
 } from "./api.js";
-import { JsProxy, JsRef, JsValue, makeProxy, unwrap, unwrapSymbol } from "./value.js";
+import { JsProxy, JsRef, JsValue, makeProxy, ToJsOptions, unwrap, unwrapSymbol } from "./value.js";
 
 export const disposeSymbol = Symbol("frida-electron-bridge.dispose");
 export const abandonSymbol = Symbol("frida-electron-bridge.abandon");
@@ -58,8 +58,8 @@ export class Realm {
         return this.#adopt(result.readPointer()).wrap();
     }
 
-    toJs(value: any): any {
-        return unwrap(value).toJs();
+    toJs(value: any, options?: ToJsOptions): any {
+        return unwrap(value).toJs(options);
     }
 
     await(value: any): Promise<any> {
