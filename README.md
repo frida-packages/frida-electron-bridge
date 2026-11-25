@@ -158,6 +158,7 @@ against a minimal Electron app in `tests/fixture`:
 ```sh
 npm install
 npm test
+npm run typecheck
 ```
 
 `tests/realm.test.ts` depends on that fixture; `tests/runtime.test.ts` does not,

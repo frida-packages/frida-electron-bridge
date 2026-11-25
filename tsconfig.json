@@ -11,11 +11,10 @@
       "frida-gum"
     ],
     "declaration": true,
+    "rootDir": "./lib",
     "outDir": "./dist"
   },
   "include": [
-    "lib/**/*",
-    "tests/**/*",
-    "examples/**/*"
+    "lib/**/*"
   ]
 }
