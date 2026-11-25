@@ -59,7 +59,10 @@ const versions = await Electron.evaluate("process.versions");
 The handle passed to `perform()`.
 
 - `global` — the target's global object, as a proxy.
-- `require(id)` — resolve a module through the realm's `require`.
+- `require(id)` — resolve a module through the realm's `require`: the global
+  one where there is one, else the app's main module's, else one created with
+  `module.createRequire()` at the app's entry point (an app whose entry is an ES
+  module has no main module).
 - `evaluate(source)` — evaluate source in the target's context.
 - `toJs(value)` — deep-convert a target value into a plain agent-side value.
 - `fromJs(value)` — convert an agent-side value into a target value. Agent
@@ -203,12 +206,14 @@ window has loaded:
 ```sh
 npm install
 npm test
+npm run test:esm
 npm run typecheck
 ```
 
-`tests/realm.test.ts` depends on that fixture; `tests/runtime.test.ts` does not,
-so it runs against any Electron app. `injest.config.json` defines a `discord`
-target for that:
+`npm run test:esm` runs it against `tests/fixture-esm`, the same app behind an
+ES module entry point. `tests/realm.test.ts` depends on the fixture;
+`tests/runtime.test.ts` does not, so it runs against any Electron app.
+`injest.config.json` defines a `discord` target for that:
 
 ```sh
 npx injest runtime --target discord

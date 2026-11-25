@@ -305,8 +305,7 @@ export class Realm {
 
     #getRequire(): JsValue {
         if (this.#requireFn === null) {
-            this.#requireFn = this.persist(this.evaluate(
-                "(typeof require === 'function') ? require : process.mainModule.require.bind(process.mainModule)"));
+            this.#requireFn = this.persist(this.evaluate(REQUIRE_LOOKUP));
         }
         return this.#requireFn.get();
     }
@@ -478,3 +477,22 @@ const FUNCTION_WRAPPER_FACTORY = `(function (flagBuffer, invoke, release) {
         return fn;
     };
 })`;
+
+const REQUIRE_LOOKUP = `(() => {
+    if (typeof require === "function") {
+        return require;
+    }
+
+    const { mainModule } = process;
+    if (mainModule?.id === ".") {
+        return mainModule.require.bind(mainModule);
+    }
+
+    const { createRequire } = process.getBuiltinModule("module");
+    const { join } = process.getBuiltinModule("path");
+    const resourcesRequire = createRequire(join(process.resourcesPath, "package.json"));
+    const appPath = (process.type === "browser")
+        ? resourcesRequire("electron").app.getAppPath()
+        : process.argv.find(arg => arg.startsWith("--app-path="))?.substring("--app-path=".length);
+    return (appPath !== undefined) ? createRequire(resourcesRequire.resolve(appPath)) : resourcesRequire;
+})()`;

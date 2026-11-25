@@ -14,6 +14,10 @@ describe("realm", () => {
         expect(realm.toJs(electron.app.getName())).toBe("frida-electron-bridge-fixture");
     }));
 
+    test("resolves app-relative modules through require()", () => Electron.perform(realm => {
+        expect(realm.toJs(realm.require("./package.json").name)).toBe("frida-electron-bridge-fixture");
+    }));
+
     test("converts nested structures", () => Electron.perform(realm => {
         expect(realm.toJs(realm.global.fixture.profile)).toEqual({ name: "frida", tags: ["a", "b"] });
         expect(realm.toJs(realm.global.fixture.numbers)).toEqual([1, 2, 3]);

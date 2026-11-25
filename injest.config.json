@@ -11,6 +11,16 @@
       },
       "timeout": 30000
     },
+    "fixture-esm": {
+      "device": "local",
+      "session": {
+        "spawn": "node_modules/electron/dist/Electron.app/Contents/MacOS/Electron",
+        "args": [
+          "tests/fixture-esm"
+        ]
+      },
+      "timeout": 30000
+    },
     "discord": {
       "device": "local",
       "session": {

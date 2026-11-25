@@ -29,7 +29,8 @@
     "build": "tsc",
     "watch": "tsc -w",
     "typecheck": "tsc -p tests && tsc -p examples",
-    "test": "injest"
+    "test": "injest",
+    "test:esm": "injest --target fixture-esm"
   },
   "devDependencies": {
     "@frida/injest": "^0.1.0",
